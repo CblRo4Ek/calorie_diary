@@ -472,9 +472,14 @@ def image_info(path):
     return width, height, digest, f"{dhash:016x}", orientation
 
 
+def duplicate_priority(record):
+    """Prefer labeled records, then holdouts, then stable source IDs."""
+    rank = {"train": 0, "val": 1, "test": 2, "fpb_test_unlabeled": 3}
+    return (record["objects"] is None, -rank[record["split"]], record["source"], record["source_id"])
+
+
 def deduplicate(records):
     """Deduplicate exact pixels and quarantine conflicting annotations."""
-    rank = {"train": 0, "val": 1, "test": 2, "fpb_test_unlabeled": 3}
     by_hash = defaultdict(list)
     for record in records:
         by_hash[record["pixel_sha256"]].append(record)
@@ -484,7 +489,7 @@ def deduplicate(records):
         if len(signatures) > 1:
             audit.extend({"source": r["source"], "source_id": r["source_id"], "reason": "conflicting_duplicate"} for r in group)
             continue
-        ordered = sorted(group, key=lambda r: (-rank[r["split"]], r["source"], r["source_id"]))
+        ordered = sorted(group, key=duplicate_priority)
         kept.append(ordered[0])
         audit.extend({"source": r["source"], "source_id": r["source_id"], "reason": "pixel_duplicate"} for r in ordered[1:])
     return sorted(kept, key=lambda r: (r["source"], r["source_id"])), audit
@@ -497,7 +502,7 @@ def dataset_path(data_dir, mode):
 
 
 def _build_signature(cats, decisions, mode, val_fraction, seed):
-    return fingerprint({"pipeline": "fpb_myfoodrepo_v2_1_pixels_only", "catalogs": cats, "decisions": decisions.to_dict("records"),
+    return fingerprint({"pipeline": "fpb_myfoodrepo_v2_1_pixels_labeled_first", "catalogs": cats, "decisions": decisions.to_dict("records"),
                         "mode": mode, "val_fraction": val_fraction, "seed": seed})
 
 
