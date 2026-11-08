@@ -1,17 +1,17 @@
-"""FPB + Food-101 ingestion. Source labels are never silently treated as background.
+"""FPB + MyFoodRepo v2.1 ingestion. Source labels are never silently treated as background.
 
 All downloaded assets, caches, decisions and exports live under the supplied data/.
-Food-101 uses a full-image proxy box by the project's explicit baseline decision.
+Food-101 is an optional unlabeled inference sample, never a training source.
 Only the first five YOLO fields survive FPB ingestion; weights are discarded.
 """
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import math
 import os
 import re
+import random
 import shutil
 import ssl
 import tempfile
@@ -20,21 +20,19 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 import yaml
 from PIL import Image
+from tqdm.auto import tqdm
 
 FPB_REPO = "issai/Food_Portion_Benchmark"
 FOOD_REPO = "ethz/food101"
 FPB_PREFIX = "FPB_Dataset/RGB"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-PROXY_BOX = [0.5, 0.5, 1.0, 1.0]
 _sessions = threading.local()
 _catalog_cache = {}
 _tree_cache = {}
-_food_index_cache = {}
 _preview_cache = {}
 
 
@@ -50,7 +48,7 @@ def configure_https(data_dir):
         content += "\n" + "".join(ssl.DER_cert_to_PEM_cert(cert) for cert in certs)
         path.write_text(content, encoding="ascii")
     os.environ["REQUESTS_CA_BUNDLE"] = str(path)
-    # huggingface_hub 1.x uses HTTPX, which reads the standard SSL_CERT_FILE.
+    # Expose the same trust bundle to other Python HTTP clients in notebooks.
     os.environ.setdefault("SSL_CERT_FILE", str(path))
 
 
@@ -116,41 +114,60 @@ def download(url, path):
                 raise
 
 
-def catalogs(data_dir, offline=False):
-    """Cache pinned catalogs in data/metadata for subsequent runs."""
+def catalogs(data_dir, offline=False, *, myfoodrepo_source="download", train_archive=None, valid_archive=None):
+    """Pin FPB and MyFoodRepo's selected input source and author splits."""
+    from scripts import myfoodrepo as mfr
     configure_https(data_dir)
-    key = str(Path(data_dir).resolve())
+    if myfoodrepo_source not in {"download", "archives"}:
+        raise ValueError("MYFOODREPO_SOURCE должен быть download или archives.")
+    archives = {}
+    if myfoodrepo_source == "archives":
+        if train_archive is None or valid_archive is None:
+            raise ValueError("Укажите train и valid архивы MyFoodRepo v2.1.")
+        archives["train"] = mfr.archive_info(train_archive)
+    if valid_archive is not None:
+        archives["val"] = mfr.archive_info(valid_archive)
+    inputs = {"input_source": myfoodrepo_source, "archives": archives,
+              "splits": ["train", "val"] if "val" in archives else ["train"]}
+    key = (str(Path(data_dir).resolve()), fingerprint(inputs))
     if key in _catalog_cache:
         return _catalog_cache[key]
-    path = Path(data_dir) / "metadata/sources.lock.json"
+    lock_name = "fpb_myfoodrepo_archives_sources.lock.json" if archives else "fpb_myfoodrepo_sources.lock.json"
+    path = Path(data_dir) / "metadata" / lock_name
     if path.exists():
-        _catalog_cache[key] = read_json(path)
-        return _catalog_cache[key]
-    if offline:
-        raise FileNotFoundError(f"Для первого запуска нужен интернет: отсутствует {path}")
-    infos = {}
-    for source, repo in (("fpb", FPB_REPO), ("food101", FOOD_REPO)):
-        infos[source] = request(f"https://huggingface.co/api/datasets/{repo}").json()
-    fpb_sha = infos["fpb"]["sha"]
-    fpb_config = yaml.safe_load(request(
-        f"https://huggingface.co/datasets/{FPB_REPO}/raw/{fpb_sha}/{FPB_PREFIX}/data.yaml"
-    ).text)
-    fpb_names = fpb_config["names"]
-    if isinstance(fpb_names, dict):
-        fpb_names = [fpb_names[i] for i in range(len(fpb_names))]
-    features = infos["food101"]["cardData"]["dataset_info"]["features"]
-    labels = next(item for item in features if item["name"] == "label")["dtype"]["class_label"]["names"]
-    food_names = labels if isinstance(labels, list) else [labels[str(i)] for i in range(len(labels))]
-    if len(fpb_names) != 138 or len(food_names) != 101:
-        raise ValueError("Изменился опубликованный словарь классов. Проверьте новый релиз.")
-    result = {
-        "fpb": {"repo": FPB_REPO, "revision": fpb_sha, "names": fpb_names},
-        "food101": {"repo": FOOD_REPO, "revision": infos["food101"]["sha"], "names": food_names,
-                    "files": [x["rfilename"] for x in infos["food101"]["siblings"]
-                              if x["rfilename"].endswith(".parquet")]},
-    }
-    _catalog_cache[key] = result
+        saved = read_json(path)
+        if (saved["myfoodrepo"].get("input_source", "download") == myfoodrepo_source
+                and saved["myfoodrepo"].get("archives", {}) == archives):
+            _catalog_cache[key] = saved
+            return saved
+    fpb_cache = next((p for p in (path, Path(data_dir) / "metadata/fpb_myfoodrepo_sources.lock.json",
+                                 Path(data_dir) / "metadata/sources.lock.json") if p.exists()), None)
+    if fpb_cache is not None:
+        fpb = read_json(fpb_cache)["fpb"]
+    else:
+        if offline:
+            raise FileNotFoundError("Отсутствует кеш каталога FPB.")
+        info = request(f"https://huggingface.co/api/datasets/{FPB_REPO}").json()
+        config = yaml.safe_load(request(f"https://huggingface.co/datasets/{FPB_REPO}/raw/{info['sha']}/{FPB_PREFIX}/data.yaml").text)
+        names = config["names"]
+        names = [names[i] for i in range(len(names))] if isinstance(names, dict) else names
+        if len(names) != 138:
+            raise ValueError("Изменился словарь классов FPB.")
+        fpb = {"repo": FPB_REPO, "revision": info["sha"], "names": names}
+    coco = mfr.load_annotations(data_dir, offline=offline, catalog=inputs)
+    categories = sorted(coco["categories"], key=lambda c: c["id"])
+    if "val" in archives:
+        validation = mfr.load_annotations(data_dir, offline=offline, catalog=inputs, split="val")
+        if {c["id"]: c["name"] for c in validation["categories"]} != {c["id"]: c["name"] for c in categories}:
+            raise ValueError("Словари классов train и valid архивов не совпадают.")
+    result = {"fpb": fpb, "myfoodrepo": {
+        "repo": mfr.DATASET_REF if myfoodrepo_source == "download" else "AIcrowd/MyFoodRepo-v2.1",
+        "revision": str(mfr.MIRROR_VERSION) if myfoodrepo_source == "download" else fingerprint(archives)[:12],
+        "dataset_version": "2.1", "source": mfr.SOURCE_PAGE, "mirror": mfr.MIRROR_PAGE,
+        "names": [c["name"] for c in categories], "category_ids": [c["id"] for c in categories],
+    } | inputs}
     dump_json(path, result)
+    _catalog_cache[key] = result
     return result
 
 
@@ -260,21 +277,29 @@ def prepare_fpb_preview(data_dir, catalog, wanted, per_class=3, split="train", m
     counts = Counter()
     selected = []
     scanned = 0
-    for offset in range(0, min(len(records), max_scan), 64):
-        batch = records[offset:min(offset+64, max_scan)]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            annotations = list(pool.map(lambda r: fpb_objects(data_dir, catalog, r), batch))
-        for record, objects in zip(batch, annotations):
-            scanned += 1
-            names = {catalog["names"][obj["source_class_id"]] for obj in objects}
-            needed = {name for name in names & wanted if counts[name] < per_class}
-            if needed:
-                selected.append((record, objects))
-                counts.update(names & wanted)
-        if all(counts[name] >= per_class for name in wanted):
-            break
+    limit = min(len(records), max_scan)
+    with tqdm(total=limit, desc="FPB: поиск примеров", unit="метка") as progress:
+        for offset in range(0, limit, 64):
+            batch = records[offset:min(offset+64, max_scan)]
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                annotations = list(pool.map(lambda r: fpb_objects(data_dir, catalog, r), batch))
+            for record, objects in zip(batch, annotations):
+                scanned += 1
+                names = {catalog["names"][obj["source_class_id"]] for obj in objects}
+                needed = {name for name in names & wanted if counts[name] < per_class}
+                if needed:
+                    selected.append((record, objects))
+                    counts.update(names & wanted)
+            progress.update(len(batch))
+            if all(counts[name] >= per_class for name in wanted):
+                progress.total = scanned
+                progress.refresh()
+                break
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        result = list(pool.map(lambda args: fpb_materialize(data_dir, catalog, *args), selected))
+        result = list(tqdm(
+            pool.map(lambda args: fpb_materialize(data_dir, catalog, *args), selected),
+            total=len(selected), desc="FPB preview: подготовка фото", unit="фото",
+        ))
     return result, {"scanned": scanned, "counts": dict(counts),
                     "missing": sorted(name for name in wanted if counts[name] < per_class)}
 
@@ -290,229 +315,77 @@ def food_rows(catalog, split, offset, length):
     return result["rows"]
 
 
-class HTTPRangeReader(io.RawIOBase):
-    """Read only requested Parquet column chunks; never buffer a whole image shard."""
-    def __init__(self, url):
-        super().__init__()
-        self.url, self.position = url, 0
-        with request(url, headers={"Range": "bytes=0-0"}, stream=True) as response:
-            if response.status_code != 206 or "Content-Range" not in response.headers:
-                raise ValueError("Сервер не поддерживает Range. Используйте полную загрузку Parquet.")
-            self.size = int(response.headers["Content-Range"].split("/")[-1])
-
-    def readable(self):
-        return True
-
-    def seekable(self):
-        return True
-
-    def tell(self):
-        return self.position
-
-    def seek(self, offset, whence=0):
-        value = offset if whence == 0 else self.position + offset if whence == 1 else self.size + offset
-        if value < 0:
-            raise ValueError("Отрицательная позиция файла")
-        self.position = value
-        return value
-
-    def read(self, size=-1):
-        size = min(self.size-self.position, size if size >= 0 else self.size-self.position)
-        if size <= 0:
-            return b""
-        start = self.position
-        with request(self.url, headers={"Range": f"bytes={start}-{start+size-1}"}, stream=True) as response:
-            if response.status_code != 206:
-                raise ValueError("Сервер проигнорировал Range; полная загрузка не выполнялась.")
-            content = response.content
-        if len(content) != size:
-            raise IOError("Неполный ответ Range")
-        self.position += len(content)
-        return content
-
-
-def food_preview_blocks(data_dir, catalog, split="train", workers=8):
-    """Cache the exact Parquet class index and per-shard labels on disk."""
-    import pyarrow.parquet as pq
-    key = (str(Path(data_dir).resolve()), catalog["repo"], catalog["revision"], split)
-    if key in _food_index_cache:
-        return _food_index_cache[key]
-    path = Path(data_dir) / "metadata" / f'food101_row_index_{catalog["revision"]}_{split}.json'
-    if path.exists():
-        _food_index_cache[key] = read_json(path)
-        return _food_index_cache[key]
-    def inspect(remote):
-        cache = path.parent / f'food101_labels_{catalog["revision"]}_{Path(remote).stem}.json'
-        if cache.exists():
-            return read_json(cache)
-        url = f'https://huggingface.co/datasets/{catalog["repo"]}/resolve/{catalog["revision"]}/{remote}'
-        with HTTPRangeReader(url) as stream:
-            parquet = pq.ParquetFile(stream)
-            values = []
-            for group_id in range(parquet.num_row_groups):
-                group = parquet.metadata.row_group(group_id)
-                column = next(group.column(i) for i in range(group.num_columns)
-                              if group.column(i).path_in_schema == "label")
-                stats = column.statistics
-                if stats and stats.has_min_max and stats.min == stats.max and stats.null_count == 0:
-                    values.extend([int(stats.min)] * group.num_rows)
-                else:
-                    values.extend(parquet.read_row_group(group_id, columns=["label"])["label"].to_pylist())
-        print(f"Indexed labels: {Path(remote).name} ({len(values)} rows)", flush=True)
-        dump_json(cache, values)
-        return values
-    files = sorted(remote for remote in catalog["files"] if remote.startswith(f"data/{split}-"))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        shards = list(pool.map(inspect, files))
-    index = defaultdict(list)
-    offset = 0
-    for labels in shards:
-        for label in labels:
-            index[str(label)].append(offset)
-            offset += 1
-    expected_count = 750 if split == "train" else 250
-    if len(index) != len(catalog["names"]) or any(len(rows) != expected_count for rows in index.values()):
-        raise ValueError("Food-101: изменилась полнота исходной разметки. Проверьте новый релиз.")
-    _food_index_cache[key] = dict(index)
-    dump_json(path, _food_index_cache[key])
-    return _food_index_cache[key]
-
-
-def prepare_food_preview(data_dir, catalog, wanted, per_class=4, split="train", workers=8):
-    if not 1 <= per_class <= 100:
-        raise ValueError("Preview per_class должен быть от 1 до 100.")
-    blocks = food_preview_blocks(data_dir, catalog, split, workers)
-    def prepare(name):
-        class_id = catalog["names"].index(name)
-        indices = blocks[str(class_id)][:per_class]
-        local_paths = [Path(data_dir) / "raw/food101" / catalog["revision"] / split / f"{i:06d}.jpg" for i in indices]
-        if all(path.exists() for path in local_paths):
-            return [food_record(path, split, i, class_id) for path, i in zip(local_paths, indices)]
-        if indices == list(range(indices[0], indices[0] + len(indices))):
-            rows = food_rows(catalog, split, indices[0], len(indices))
-        else:
-            rows = [food_rows(catalog, split, index, 1)[0] for index in indices]
-        result = []
-        for item in rows:
-            row_idx, row = item["row_idx"], item["row"]
-            if row["label"] != class_id:
-                raise ValueError("Изменился индекс классов Food-101 preview.")
-            path = Path(data_dir) / "raw/food101" / catalog["revision"] / split / f"{row_idx:06d}.jpg"
-            download(row["image"]["src"], path)
-            result.append(food_record(path, split, row_idx, class_id))
-        return result
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return [record for group in pool.map(prepare, sorted(set(wanted))) for record in group]
-
-
-def prepare_food_slice(data_dir, catalog, split="validation", offset=0, length=4):
-    """Small original test slice, without a second class-block discovery pass."""
-    records = []
-    for item in food_rows(catalog, split, offset, length):
-        row_idx, row = item["row_idx"], item["row"]
-        path = Path(data_dir) / "raw/food101" / catalog["revision"] / split / f"{row_idx:06d}.jpg"
-        download(row["image"]["src"], path)
-        records.append(food_record(path, split, row_idx, row["label"]))
-    return records
-
-
-def preview_samples(data_dir, cats, per_class=3, max_scan=1600, workers=8):
-    """Shared, real-image preview for both notebooks; full preparation is separate."""
+def preview_samples(data_dir, cats, per_class=2, max_scan=1600, workers=8):
+    from scripts import myfoodrepo as mfr
     frame = review_table(cats)
-    config = {"catalogs": cats, "per_class": per_class, "max_scan": max_scan}
+    config = {"catalogs": cats, "per_class": per_class, "max_scan": max_scan, "pipeline": 2}
     key = (str(Path(data_dir).resolve()), fingerprint(config))
-    cache = Path(data_dir) / "metadata" / f"preview_samples_{fingerprint(config)[:12]}.json"
+    cache = Path(data_dir) / "metadata" / f"fpb_myfoodrepo_preview_samples_{fingerprint(config)[:12]}.json"
     if key not in _preview_cache and cache.exists():
         _preview_cache[key] = read_json(cache)
     if key in _preview_cache:
         payload = _preview_cache[key]
         if all(Path(r["image"]).is_file() for r in payload["records"]):
+            tqdm.write(f"Preview: {len(payload['records'])} фото уже подготовлены.")
             return payload["records"], payload["coverage"]
-    fpb_records, coverage = prepare_fpb_preview(
-        data_dir, cats["fpb"], frame["fpb_class"], per_class=per_class,
-        max_scan=max_scan, workers=workers,
-    )
-    wanted_food = sorted(set(frame["food101_class"]) | {"apple_pie", "sushi", "waffles"})
-    food_records = prepare_food_preview(data_dir, cats["food101"], wanted_food, per_class=per_class+1, workers=workers)
-    # Native FPB validation and unlabelled test retain their identities.
+    fpb_records, coverage = prepare_fpb_preview(data_dir, cats["fpb"], frame["fpb_class"],
+                                               per_class=per_class, max_scan=max_scan, workers=workers)
+    wanted = sorted(set(frame["myfoodrepo_class"]) | {"avocado", "banana", "tomato"})
+    other = mfr.prepare(data_dir, cats["myfoodrepo"], wanted=wanted, per_class=per_class, workers=workers, valid_limit=6)
     for split, limit in (("val", 6), ("test", 2)):
-        for record in fpb_index(data_dir, cats["fpb"], (split,))[:limit]:
-            fpb_records.append(fpb_materialize(data_dir, cats["fpb"], record,
-                                             fpb_objects(data_dir, cats["fpb"], record)))
-    food_records += prepare_food_slice(data_dir, cats["food101"])
-    payload = {"records": fpb_records + food_records, "coverage": coverage}
-    _preview_cache[key] = payload
+        for record in tqdm(fpb_index(data_dir, cats["fpb"], (split,))[:limit], desc=f"FPB {split}: preview", unit="фото"):
+            fpb_records.append(fpb_materialize(data_dir, cats["fpb"], record, fpb_objects(data_dir, cats["fpb"], record)))
+    payload = {"records": fpb_records + other, "coverage": coverage}
     dump_json(cache, payload)
+    _preview_cache[key] = payload
     return payload["records"], coverage
 
 
-def food_record(path, split, row_idx, class_id):
-    uid = f"{split}/{row_idx:06d}"
-    return {"source": "food101", "source_id": uid, "source_split": split,
-            "group_id": f"food101/{uid}", "box_origin": "full_image_proxy",
-            "image": str(Path(path).resolve()),
-            "objects": [{"source_class_id": class_id, "bbox": PROXY_BOX.copy()}]}
-
-
 def prepare_full(data_dir, cats, workers=8):
-    """Download FPB images/clean labels and Food-101 Parquet into data/, resumably."""
-    from huggingface_hub import hf_hub_download
-    import pyarrow.parquet as pq
-
+    from scripts import myfoodrepo as mfr
     fpb_records = fpb_index(data_dir, cats["fpb"])
     def prepare(record):
-        objects = fpb_objects(data_dir, cats["fpb"], record)
-        return fpb_materialize(data_dir, cats["fpb"], record, objects)
+        return fpb_materialize(data_dir, cats["fpb"], record, fpb_objects(data_dir, cats["fpb"], record))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        result = list(pool.map(prepare, fpb_records))
-    for native_split in ("train", "validation"):
-        offset = 0
-        for remote in sorted(x for x in cats["food101"]["files"] if x.startswith(f"data/{native_split}-")):
-            local = hf_hub_download(
-                repo_id=FOOD_REPO, repo_type="dataset", revision=cats["food101"]["revision"],
-                filename=remote, cache_dir=str(Path(data_dir) / "cache/huggingface"),
-            )
-            for batch in pq.ParquetFile(local).iter_batches(batch_size=128, columns=["image", "label"]):
-                for row in batch.to_pylist():
-                    class_id = int(row["label"])
-                    if not 0 <= class_id < len(cats["food101"]["names"]):
-                        raise ValueError("Неизвестный класс Food-101")
-                    path = Path(data_dir) / "raw/food101" / cats["food101"]["revision"] / native_split / f"{offset:06d}.jpg"
-                    if not path.exists():
-                        image_bytes = row["image"]["bytes"]
-                        if image_bytes is None:
-                            raise ValueError("Parquet не содержит байты изображения Food-101.")
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(image_bytes)
-                    result.append(food_record(path, native_split, offset, class_id))
-                    offset += 1
-        expected = 75750 if native_split == "train" else 25250
-        if offset != expected:
-            raise ValueError(f"Неполная загрузка Food-101 {native_split}: {offset}, ожидалось {expected}")
-    return result
+        records = list(tqdm(pool.map(prepare, fpb_records), total=len(fpb_records),
+                            desc="FPB: фото и разметка", unit="фото"))
+    return records + mfr.prepare(data_dir, cats["myfoodrepo"], workers=workers)
 
 
 # These are hypotheses for visual review, never automatic synonym merges.
 SYNONYM_CANDIDATES = [
-    ("icecream", "ice_cream", "likely_alias", "Разное написание мороженого"),
-    ("cupcake", "cup_cakes", "likely_alias", "Единственное/множественное число"),
-    ("pahlava", "baklava", "likely_alias", "Варианты названия пахлавы"),
-    ("burger", "hamburger", "needs_review", "Бургер может быть шире гамбургера"),
-    ("bliny", "pancakes", "related", "Блины и панкейки могут различаться"),
-    ("salmon", "grilled_salmon", "related", "Второй класс задаёт способ приготовления"),
-    ("fried_dumplings", "dumplings", "related", "Общий класс и жареный подтип"),
-    ("samsa", "samosa", "related", "Разные блюда; созвучие не означает синонимию"),
+    ("almond", "almonds", "likely_alias", "Единственное/множественное число"),
+    ("apple_juice", "juice_apple", "likely_alias", "Яблочный сок"),
+    ("capuccino", "cappuccino", "likely_alias", "Разное написание капучино"),
+    ("french_fries", "chips_french_fries", "likely_alias", "Картофель фри"),
+    ("icecream", "ice_cream_n_s", "likely_alias", "Общий класс мороженого"),
+    ("raisins", "raisins_dried", "likely_alias", "Изюм"),
+    ("toast", "bread_toast", "likely_alias", "Тостовый хлеб"),
+    ("beef", "beef_n_s", "likely_alias", "Общий класс говядины"),
+    ("chocolate", "chocolate_n_s", "likely_alias", "Общий класс шоколада"),
+    ("kefir", "kefir_drink", "likely_alias", "Кефир"),
+    ("burger", "hamburger", "related", "Общий класс и более узкая категория"),
+    ("bliny", "crepe_with_flour_plain", "related", "Проверить вид блинов и состав"),
+    ("bliny", "pancake", "related", "Блины и панкейки могут различаться"),
+    ("black_tea", "tea", "related", "Tea включает несколько видов чая"),
+    ("pizza", "pizza_margherita_baked", "related", "Общий класс и вид пиццы"),
+    ("pizza", "pizza_with_vegetables_baked", "related", "Общий класс и вид пиццы"),
+    ("mashed_potato", "mashed_potatoes_prepared_with_full_fat_milk_with_butter", "related", "Конкретная рецептура"),
+    ("raspberry_jam", "jam", "related", "Малиновое варенье и общий класс"),
+    ("lentiil_soup", "soup_of_lentils_dahl_dhal", "related", "Чечевичный суп и конкретный вид"),
+    ("coke", "cola_based_drink", "related", "Бренд и общая категория"),
+    ("cupcake", "muffin", "related", "Разные виды выпечки"),
+    ("dried_apricot", "apricots", "related", "Сушёный и свежий продукт"),
 ]
-
 
 def review_table(cats):
     import pandas as pd
-    rows = [{"fpb_class": name, "food101_class": name, "kind": "exact_name",
-             "decision": "merge", "reviewed": True, "note": "Одинаковое имя; визуальная проверка рекомендуется"}
-            for name in sorted(set(cats["fpb"]["names"]) & set(cats["food101"]["names"]))]
-    rows += [{"fpb_class": a, "food101_class": b, "kind": kind, "decision": "keep_separate",
+    rows = [{"fpb_class": name, "myfoodrepo_class": name, "kind": "exact_name",
+             "decision": "merge", "reviewed": True, "note": "Одинаковое имя; проверьте визуально"}
+            for name in sorted(set(cats["fpb"]["names"]) & set(cats["myfoodrepo"]["names"]))]
+    rows += [{"fpb_class": a, "myfoodrepo_class": b, "kind": kind, "decision": "keep_separate",
               "reviewed": False, "note": note} for a, b, kind, note in SYNONYM_CANDIDATES
-             if a in cats["fpb"]["names"] and b in cats["food101"]["names"]]
+             if a in cats["fpb"]["names"] and b in cats["myfoodrepo"]["names"]]
     return pd.DataFrame(rows)
 
 
@@ -523,38 +396,39 @@ def save_decisions(frame, path, cats):
 
 
 def validate_decisions(frame, cats):
-    if frame["food101_class"].duplicated().any():
-        raise ValueError("Один класс Food-101 указан в решениях несколько раз.")
+    if "myfoodrepo_class" not in frame:
+        raise ValueError("Нужна отдельная таблица решений FPB + MyFoodRepo.")
+    if frame["myfoodrepo_class"].duplicated().any():
+        raise ValueError("Класс MyFoodRepo указан в решениях несколько раз.")
     for row in frame.to_dict("records"):
-        if row["fpb_class"] not in cats["fpb"]["names"] or row["food101_class"] not in cats["food101"]["names"]:
+        if row["fpb_class"] not in cats["fpb"]["names"] or row["myfoodrepo_class"] not in cats["myfoodrepo"]["names"]:
             raise ValueError("Неизвестный класс в решениях.")
         if row["decision"] not in {"merge", "keep_separate"}:
             raise ValueError("Решение должно быть merge или keep_separate.")
         if row["decision"] == "merge" and str(row["reviewed"]).lower() != "true":
-            raise ValueError(f'Сначала подтвердите reviewed=True для {row["food101_class"]}')
+            raise ValueError(f"Подтвердите reviewed=True для {row['myfoodrepo_class']}")
 
 
 def class_mapping(cats, decisions):
     validate_decisions(decisions, cats)
     names = list(cats["fpb"]["names"])
-    targets = {row["food101_class"]: row for row in decisions.to_dict("records")}
+    targets = {row["myfoodrepo_class"]: row for row in decisions.to_dict("records")}
     mapping = {("fpb", idx): idx for idx in range(len(names))}
     rows = [{"source": "fpb", "source_class_id": idx, "source_class": name,
              "class_id": idx, "class_name": name, "rule": "fpb_base"} for idx, name in enumerate(names)]
-    for idx, name in enumerate(cats["food101"]["names"]):
+    for source_id, name in zip(cats["myfoodrepo"]["category_ids"], cats["myfoodrepo"]["names"]):
         decision = targets.get(name)
         if decision and decision["decision"] == "merge":
             target = decision["fpb_class"]
             rule = "exact_name" if name == target else "reviewed_alias"
         else:
-            # A deliberately rejected same-name match must remain distinguishable.
-            target = f"food101__{name}" if name in names else name
-            rule = "food101_separate"
+            target = f"myfoodrepo__{name}" if name in names else name
+            rule = "myfoodrepo_separate"
         if target not in names:
             names.append(target)
         class_id = names.index(target)
-        mapping[("food101", idx)] = class_id
-        rows.append({"source": "food101", "source_class_id": idx, "source_class": name,
+        mapping[("myfoodrepo", source_id)] = class_id
+        rows.append({"source": "myfoodrepo", "source_class_id": source_id, "source_class": name,
                      "class_id": class_id, "class_name": target, "rule": rule})
     return names, mapping, rows
 
@@ -563,21 +437,24 @@ def assign_splits(records, val_fraction=0.1, seed=42):
     if not 0 < val_fraction < 1:
         raise ValueError("val_fraction должен находиться между 0 и 1.")
     result = [dict(record) for record in records]
-    food_train = defaultdict(list)
+    other = []
+    has_native_val = any(r["source"] == "myfoodrepo" and r["source_split"] in {"val", "valid"} for r in result)
     for record in result:
         if record["source"] == "fpb":
             record["split"] = "fpb_test_unlabeled" if record["source_split"] == "test" else record["source_split"]
-        elif record["source_split"] == "validation":
-            record["split"] = "test"  # HF validation is the original Food-101 test.
-        elif record["source_split"] == "train":
-            food_train[record["objects"][0]["source_class_id"]].append(record)
+        elif record["source"] == "myfoodrepo" and record["source_split"] in {"val", "valid"}:
+            record["split"] = "val"
+        elif record["source"] == "myfoodrepo" and record["source_split"] == "train":
+            if has_native_val or record.get("preserve_source_split", False):
+                record["split"] = "train"
+            else:
+                other.append(record)
         else:
-            raise ValueError(f'Неизвестный split: {record["source_split"]}')
-    for group in food_train.values():
-        ordered = sorted(group, key=lambda r: fingerprint([seed, r["group_id"]]))
-        val_count = max(1, round(len(group) * val_fraction)) if len(group) > 1 else 0
-        for i, record in enumerate(ordered):
-            record["split"] = "val" if i < val_count else "train"
+            raise ValueError(f"Источник не включён в обучение: {record['source']}")
+    ordered = sorted(other, key=lambda r: fingerprint([seed, r["group_id"]]))
+    val_count = max(1, round(len(ordered) * val_fraction)) if len(ordered) > 1 else 0
+    for i, record in enumerate(tqdm(ordered, desc="Разбиение MyFoodRepo", unit="фото", disable=not ordered)):
+        record["split"] = "val" if i < val_count else "train"
     return result
 
 
@@ -596,23 +473,14 @@ def image_info(path):
 
 
 def deduplicate(records):
-    """Protect holdouts. Conflicting duplicate annotations are quarantined."""
+    """Deduplicate exact pixels and quarantine conflicting annotations."""
     rank = {"train": 0, "val": 1, "test": 2, "fpb_test_unlabeled": 3}
-    group_rank = defaultdict(int)
-    for record in records:
-        group_rank[record["group_id"]] = max(group_rank[record["group_id"]], rank[record["split"]])
-    candidates, audit = [], []
-    for record in records:
-        if rank[record["split"]] < group_rank[record["group_id"]]:
-            audit.append({"source_id": record["source_id"], "source": record["source"], "reason": "group_in_holdout"})
-        else:
-            candidates.append(record)
     by_hash = defaultdict(list)
-    for record in candidates:
+    for record in records:
         by_hash[record["pixel_sha256"]].append(record)
-    kept = []
-    for group in by_hash.values():
-        signatures = {fingerprint(record["objects"]) for record in group if record["objects"] is not None}
+    kept, audit = [], []
+    for group in tqdm(by_hash.values(), desc="Сборка: удаление дубликатов", unit="группа"):
+        signatures = {fingerprint(sorted((o["class_id"], tuple(round(v, 8) for v in o["bbox"])) for o in record["objects"])) for record in group if record["objects"] is not None}
         if len(signatures) > 1:
             audit.extend({"source": r["source"], "source_id": r["source_id"], "reason": "conflicting_duplicate"} for r in group)
             continue
@@ -622,10 +490,57 @@ def deduplicate(records):
     return sorted(kept, key=lambda r: (r["source"], r["source_id"])), audit
 
 
-def build_dataset(data_dir, cats, records, decisions, mode="preview", val_fraction=0.1, seed=42):
-    """Replace the single current export only after the new export validates."""
+def dataset_path(data_dir, mode):
+    if mode not in {"preview", "full"}:
+        raise ValueError("MODE должен быть preview или full")
+    return Path(data_dir).resolve() / "processed" / f"fpb_myfoodrepo_{mode}"
+
+
+def _build_signature(cats, decisions, mode, val_fraction, seed):
+    return fingerprint({"pipeline": "fpb_myfoodrepo_v2_1_pixels_only", "catalogs": cats, "decisions": decisions.to_dict("records"),
+                        "mode": mode, "val_fraction": val_fraction, "seed": seed})
+
+
+def _dataset_summary(mode, manifest, num_classes, excluded):
+    return {"mode": mode, "classes": num_classes, "images": len(manifest), "excluded": excluded,
+            "by_source_split": dict(Counter(f'{r["source"]}/{r["split"]}' for r in manifest)),
+            "unlabeled_fpb_test": sum(r["label"] is None for r in manifest),
+            "portion_grouping": "Exact pixel duplicates only; group_id does not filter splits."}
+
+
+def load_dataset(data_dir, cats, decisions, mode="preview", val_fraction=0.1, seed=42):
+    """Reuse a completed export without downloading, splitting or hashing images."""
+    import pandas as pd
+    output = dataset_path(data_dir, mode)
+    if not output.exists():
+        return None
+    state_path = Path(data_dir) / "metadata" / f"{output.name}.build.json"
+    required = [output / name for name in ("data.yaml", "manifest.jsonl", "class_mapping.csv", "train.txt", "val.txt")]
+    if not state_path.is_file() or not all(path.is_file() for path in required):
+        raise ValueError("Сборка не завершена. Установите OVERWRITE = True для повторной подготовки.")
+    state = read_json(state_path)
+    if state["signature"] != _build_signature(cats, decisions, mode, val_fraction, seed):
+        raise ValueError("Параметры сборки изменились. Установите OVERWRITE = True для пересборки.")
+    manifest_bytes = (output / "manifest.jsonl").read_bytes()
+    if hashlib.sha256(manifest_bytes).hexdigest() != state["manifest_sha256"]:
+        raise ValueError("Manifest отличается от завершённой сборки. Установите OVERWRITE = True.")
+    manifest = [json.loads(line) for line in manifest_bytes.decode("utf-8").splitlines()]
+    config = yaml.safe_load((output / "data.yaml").read_text(encoding="utf-8"))
+    audit_path = output / "excluded_records.json"
+    summary = _dataset_summary(mode, manifest, len(config["names"]), len(read_json(audit_path)) if audit_path.exists() else 0)
+    summary["validation"] = {"status": "REUSED", "checked_images": 0}
+    tqdm.write(f"Используется готовая сборка: {output.name} ({len(manifest)} изображений).")
+    return output, pd.DataFrame(manifest), summary
+
+
+def build_dataset(data_dir, cats, records, decisions, mode="preview", val_fraction=0.1, seed=42, overwrite=False):
+    """Keep one export per mode; reuse it unless overwrite is explicitly enabled."""
     data_dir = Path(data_dir).resolve()
-    output = data_dir / "processed/fpb_food101"
+    output = dataset_path(data_dir, mode)
+    if not overwrite:
+        saved = load_dataset(data_dir, cats, decisions, mode, val_fraction, seed)
+        if saved is not None:
+            return saved
     cache = data_dir / "cache"
     # Resolve before creating/moving/removing anything, including Windows junctions.
     for target in (output, cache):
@@ -633,7 +548,7 @@ def build_dataset(data_dir, cats, records, decisions, mode="preview", val_fracti
             raise ValueError(f"Путь выходит за пределы data/: {target}")
     cache.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="fpb_food101_build_", dir=cache) as temporary:
+    with tempfile.TemporaryDirectory(prefix="fpb_myfoodrepo_build_", dir=cache) as temporary:
         staging = Path(temporary) / "dataset"
         backup = Path(temporary) / "previous"
         _, merged, summary = _write_dataset(
@@ -648,12 +563,10 @@ def build_dataset(data_dir, cats, records, decisions, mode="preview", val_fracti
             if backup.exists():
                 backup.replace(output)
             raise
-    # Remove generated version folders from the previous layout after success.
-    for previous in output.parent.glob("fpb_food101_*"):
-        if previous.is_dir():
-            if not previous.resolve().is_relative_to(output.parent.resolve()):
-                raise ValueError(f"Путь старой сборки выходит за пределы processed/: {previous}")
-            shutil.rmtree(previous)
+    dump_json(data_dir / "metadata" / f"{output.name}.build.json", {
+        "signature": _build_signature(cats, decisions, mode, val_fraction, seed),
+        "manifest_sha256": hashlib.sha256((output / "manifest.jsonl").read_bytes()).hexdigest(),
+    })
     return output, merged, summary
 
 
@@ -663,7 +576,7 @@ def _write_dataset(cats, records, decisions, output, final_output, *, mode, val_
     names, mapping, mapping_rows = class_mapping(cats, decisions)
     records = assign_splits(records, val_fraction, seed)
     seen = set()
-    for record in records:
+    for record in tqdm(records, desc="Сборка: проверка и хеширование", unit="фото"):
         key = (record["source"], record["source_id"])
         if key in seen:
             raise ValueError(f"Повторяющийся source_id: {key}")
@@ -674,12 +587,10 @@ def _write_dataset(cats, records, decisions, output, final_output, *, mode, val_
             record["objects"] = [{"class_id": mapping[(record["source"], obj["source_class_id"])],
                                   "source_class_id": obj["source_class_id"], "bbox": list(obj["bbox"])}
                                  for obj in record["objects"]]
-            if record["box_origin"] == "full_image_proxy" and any(obj["bbox"] != PROXY_BOX for obj in record["objects"]):
-                raise ValueError("Food-101 должен иметь рамку всего изображения.")
     kept, audit = deduplicate(records)
     output.mkdir(parents=True, exist_ok=True)
     manifest = []
-    for record in kept:
+    for record in tqdm(kept, desc="Сборка: запись изображений и меток", unit="фото"):
         uid = record["source"] + "__" + fingerprint(record["source_id"])[:24]
         source = Path(record["image"])
         destination = output / "images" / record["split"] / (uid + source.suffix.lower())
@@ -723,10 +634,7 @@ def _write_dataset(cats, records, decisions, output, final_output, *, mode, val_
         listing = output / "fpb_val.txt"
         listing.write_text("".join(f"./{path}\n" for path in fpb_val), encoding="utf-8")
         (output / "fpb_eval.yaml").write_text(yaml.safe_dump(config | {"val": str(final_output / listing.name)}, allow_unicode=True), encoding="utf-8")
-    summary = {"mode": mode, "classes": len(names), "images": len(manifest), "excluded": len(audit),
-               "by_source_split": dict(Counter(f'{r["source"]}/{r["split"]}' for r in manifest)),
-               "unlabeled_fpb_test": sum(r["label"] is None for r in manifest),
-               "portion_grouping": "Only filename variants and exact pixels; physical plate IDs are not provided."}
+    summary = _dataset_summary(mode, manifest, len(names), len(audit))
     summary["validation"] = validate_export(output)
     return output, pd.DataFrame(manifest), summary
 
@@ -735,13 +643,12 @@ def validate_export(output):
     output = Path(output)
     config = yaml.safe_load((output / "data.yaml").read_text(encoding="utf-8"))
     records = [json.loads(line) for line in (output / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
-    splits_by_hash, splits_by_group = defaultdict(set), defaultdict(set)
-    for record in records:
+    splits_by_hash = defaultdict(set)
+    for record in tqdm(records, desc="Проверка сохранённого датасета", unit="фото"):
         image_path = output / record["image"]
         with Image.open(image_path) as image:
             image.verify()
         splits_by_hash[record["pixel_sha256"]].add(record["split"])
-        splits_by_group[record["group_id"]].add(record["split"])
         if record["label"] is None:
             if record["source"] != "fpb" or record["split"] != "fpb_test_unlabeled":
                 raise AssertionError("Неожиданное изображение без метки.")
@@ -756,10 +663,10 @@ def validate_export(output):
         for actual, target in zip(objects, expected):
             if actual["source_class_id"] != target["source_class_id"] or any(abs(a-b) > 1e-9 for a,b in zip(actual["bbox"], target["bbox"])):
                 raise AssertionError("ID/координаты TXT и manifest не совпали.")
-        if record["source"] == "food101" and any(obj["bbox"] != PROXY_BOX for obj in objects):
-            raise AssertionError("Неполная рамка Food-101.")
-    if any(len(x) != 1 for x in splits_by_hash.values()) or any(len(x) != 1 for x in splits_by_group.values()):
-        raise AssertionError("Обнаружено пересечение splits по пикселям/группе.")
+        if record["source"] not in {"fpb", "myfoodrepo"}:
+            raise AssertionError("Источник не должен входить в обучающий датасет.")
+    if any(len(x) != 1 for x in splits_by_hash.values()):
+        raise AssertionError("Обнаружено пересечение splits по пикселям.")
     return {"checked_images": len(records), "classes": len(config["names"]), "status": "OK"}
 
 
@@ -782,7 +689,8 @@ def show_records(records, cats, *, output_root=None, count=8, title=""):
                 names = cats
                 name = names[obj["class_id"]]
             else:
-                name = cats[record["source"]]["names"][obj["source_class_id"]]
+                info = cats[record["source"]]
+                name = dict(zip(info.get("category_ids", range(len(info["names"]))), info["names"]))[obj["source_class_id"]]
             x,y,w,h = obj["bbox"]
             axis.add_patch(Rectangle(((x-w/2)*width,(y-h/2)*height),w*width,h*height,fill=False,edgecolor="lime",linewidth=2))
             axis.text(max(0,(x-w/2)*width),max(0,(y-h/2)*height),name,fontsize=8,color="black",bbox={"facecolor":"lime","alpha":0.8,"pad":1})
@@ -796,12 +704,13 @@ def show_records(records, cats, *, output_root=None, count=8, title=""):
     return fig
 
 
-def show_class_pair(records, cats, fpb_class, food101_class, samples=3):
-    """Compare target-object crops in FPB to full Food-101 images, training only."""
+def show_class_pair(records, cats, fpb_class, myfoodrepo_class, samples=3):
+    """Compare object crops from both training sources."""
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(2, samples, figsize=(4*samples, 7), squeeze=False)
-    for row, (source, name) in enumerate((("fpb", fpb_class), ("food101", food101_class))):
-        source_id = cats[source]["names"].index(name)
+    for row, (source, name) in enumerate((("fpb", fpb_class), ("myfoodrepo", myfoodrepo_class))):
+        info = cats[source]
+        source_id = dict(zip(info["names"], info.get("category_ids", range(len(info["names"])))))[name]
         candidates = [r for r in records if r["source"] == source and r["source_split"] == "train"
                       and any(o["source_class_id"] == source_id for o in r["objects"] or [])]
         for col in range(samples):
@@ -810,18 +719,78 @@ def show_class_pair(records, cats, fpb_class, food101_class, samples=3):
                 record = candidates[col]
                 with Image.open(record["image"]) as image:
                     image = image.convert("RGB")
-                    if source == "fpb":
+                    if source in {"fpb", "myfoodrepo"}:
                         obj = next(o for o in record["objects"] if o["source_class_id"] == source_id)
                         x,y,w,h = obj["bbox"]
                         width,height = image.size
                         image = image.crop((max(0, math.floor((x-w/2)*width)), max(0, math.floor((y-h/2)*height)),
                                             min(width, math.ceil((x+w/2)*width)), min(height, math.ceil((y+h/2)*height))))
                     axis.imshow(image)
-                axis.set_title(f'{source}: {name}\n{"native bbox crop" if source == "fpb" else "full image proxy"}', fontsize=10)
+                axis.set_title(f'{source}: {name}\n{"object bbox crop"}', fontsize=10)
             else:
                 axis.text(0.5,0.5,"No sample in preview\nIncrease max_scan / use full data",ha="center",va="center")
             axis.axis("off")
-    fig.suptitle(f"{fpb_class}  /  {food101_class}")
+    fig.suptitle(f"{fpb_class}  /  {myfoodrepo_class}")
     fig.tight_layout()
     plt.show()
     return fig
+
+
+def food101_catalog(data_dir):
+    configure_https(data_dir)
+    path = Path(data_dir) / "metadata/food101_inference_sources.lock.json"
+    if path.exists():
+        return read_json(path)
+    legacy = Path(data_dir) / "metadata/sources.lock.json"
+    if legacy.exists() and "food101" in read_json(legacy):
+        old = read_json(legacy)["food101"]
+        info = {"repo": old["repo"], "revision": old["revision"]}
+    else:
+        info = {"repo": FOOD_REPO, "revision": request(f"https://huggingface.co/api/datasets/{FOOD_REPO}").json()["sha"]}
+    dump_json(path, info)
+    return info
+
+
+def food101_inference_sample(data_dir, n_images=20, seed=42, overwrite=False):
+    if not 1 <= n_images <= 25250:
+        raise ValueError("N_IMAGES должен быть от 1 до 25250.")
+    catalog = food101_catalog(data_dir)
+    output = Path(data_dir).resolve() / "raw/food101_inference_sample"
+    manifest = output / "manifest.jsonl"
+    state_path = Path(data_dir) / "metadata/food101_inference_sample.json"
+    settings = {"catalog": catalog, "n_images": n_images, "seed": seed}
+    if manifest.exists() and not overwrite:
+        if not state_path.exists() or read_json(state_path) != settings:
+            raise ValueError("Параметры Food-101 сэмпла изменились; установите OVERWRITE_FOOD101 = True.")
+        rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+        if all((output / row["image"]).is_file() for row in rows):
+            return output, rows
+    previous = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()] if manifest.exists() else []
+    rows = []
+    for index in tqdm(sorted(random.Random(seed).sample(range(25250), n_images)), desc="Food-101: фото без разметки", unit="фото"):
+        local = output / "images" / f"{index:06d}.jpg"
+        cached = Path(data_dir) / "raw/food101" / catalog["revision"] / "validation" / local.name
+        if not local.exists() and cached.is_file():
+            local.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(cached, local)
+            except OSError:
+                shutil.copy2(cached, local)
+        if not local.exists():
+            item = food_rows(catalog, "validation", index, 1)[0]
+            download(item["row"]["image"]["src"], local)
+        with Image.open(local) as image:
+            image.verify()
+        rows.append({"image": local.relative_to(output).as_posix(), "source": "food101",
+                     "source_id": f"validation/{index:06d}"})
+    output.mkdir(parents=True, exist_ok=True)
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    dump_json(state_path, settings)
+    kept = {row["image"] for row in rows}
+    for row in previous:
+        path = (output / row["image"]).resolve()
+        if not path.is_relative_to(output):
+            raise ValueError("Путь выходит за пределы сэмпла.")
+        if row["image"] not in kept:
+            path.unlink(missing_ok=True)
+    return output, rows

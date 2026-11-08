@@ -1,23 +1,23 @@
 [project]
 name = "calorie-diary"
 version = "0.1.0"
-description = "FPB and Food-101 data preparation for a Telegram calorie diary"
+description = "FPB and MyFoodRepo v2.1 data preparation for a Telegram calorie diary"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
-    "huggingface-hub>=0.24,<2",
     "requests==2.34.2",
     "pyyaml>=6,<7",
     "pillow>=10,<13",
     "numpy>=1.26,<3",
     "pandas>=2.1,<4",
     "matplotlib>=3.8,<4",
-    "pyarrow>=15,<24",
     "nbformat>=5.10,<6",
     "nbclient>=0.10,<1",
     "ipykernel>=6.29,<8",
     "ipython>=8.20,<10",
     "jupyterlab>=4.2,<5",
+    "tqdm>=4.66,<5",
+    "ipywidgets>=8,<9",
 ]
 
 [tool.uv]
