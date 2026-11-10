@@ -1,0 +1,16 @@
+data/
+
+.env
+
+.venv/
+.venv-uv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+.DS_Store
+docs/latex/*.aux
+docs/latex/*.log
+docs/latex/*.out
+docs/latex/*.synctex.gz
+docs/latex/*.pdf
