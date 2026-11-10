@@ -1,0 +1,27 @@
+{
+  "base_model": "yolo11n (COCO init)",
+  "epochs": 1,
+  "imgsz": 640,
+  "batch": 8,
+  "seed": 42,
+  "variants": {
+    "aug_geo": {
+      "degrees": 25.0,
+      "flipud": 0.3,
+      "shear": 5.0,
+      "perspective": 0.0005
+    },
+    "aug_full": {
+      "degrees": 25.0,
+      "flipud": 0.3,
+      "shear": 5.0,
+      "perspective": 0.0005,
+      "mixup": 0.15,
+      "hsv_h": 0.01
+    }
+  },
+  "train_minutes": {
+    "aug_geo": 46.5,
+    "aug_full": 47.9
+  }
+}
