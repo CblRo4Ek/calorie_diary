@@ -7,3 +7,5 @@ data/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+
+docs/latex/build/
