@@ -9,3 +9,8 @@ __pycache__/
 .ipynb_checkpoints/
 
 docs/latex/build/
+docs/latex/*.aux
+docs/latex/*.log
+docs/latex/*.out
+docs/latex/*.synctex.gz
+docs/latex/*.pdf
