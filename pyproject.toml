@@ -5,6 +5,7 @@ description = "FPB and MyFoodRepo v2.1 data preparation for a Telegram calorie d
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
+    "ultralytics==8.3.228",
     "requests==2.34.2",
     "pyyaml>=6,<7",
     "pillow>=10,<13",
